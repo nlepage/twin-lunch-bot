@@ -93,7 +93,9 @@ func run(client *socketmode.Client, messages <-chan *slackevents.MessageEvent) {
 			} else {
 				if _, _, err := client.PostMessage(
 					message.Channel,
-					slack.MsgOptionText(":robot_face: _bip bip_ Désolé vous n'avez pas de Twin Lunch :crying_cat_face:", false),
+					slack.MsgOptionText("_bip bip_ Désolé tu n'as pas de Twin Lunch :crying_cat_face:", false),
+					slack.MsgOptionIconEmoji("robot_face"),
+					slack.MsgOptionUsername("Twin Lunch Bot"),
 				); err != nil {
 					logger.Println("error sending message:", err)
 				}
@@ -108,7 +110,12 @@ func forwardMessage(client *socketmode.Client, user string, text string) {
 		logger.Println("error opening conversation:", err)
 	}
 
-	if _, _, err := client.PostMessage(channel.ID, slack.MsgOptionText(text, false)); err != nil {
+	if _, _, err := client.PostMessage(
+		channel.ID,
+		slack.MsgOptionText(text, false),
+		slack.MsgOptionIconEmoji("question"),
+		slack.MsgOptionUsername("Ton Twin Lunch"),
+	); err != nil {
 		logger.Println("error sending message:", err)
 	}
 }
