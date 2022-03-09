@@ -34,9 +34,11 @@ func main() {
 	)
 
 	var messageEvts = make(chan *slackevents.MessageEvent)
+	var incomingMessageEvts = make(chan *slackevents.MessageEvent)
 
 	go receiveMessageEvents(client, messageEvts)
-	go printMessageEvents(messageEvts)
+	go filterBotMessages(messageEvts, incomingMessageEvts)
+	go handleMessageEvents(api, incomingMessageEvts)
 
 	logger.Println("Running slack client...")
 
@@ -70,8 +72,26 @@ func receiveMessageEvents(client *socketmode.Client, out chan<- *slackevents.Mes
 	}
 }
 
-func printMessageEvents(in <-chan *slackevents.MessageEvent) {
+func filterBotMessages(in <-chan *slackevents.MessageEvent, out chan<- *slackevents.MessageEvent) {
+	for messageEvt := range in {
+		if messageEvt.BotID != "" {
+			continue
+		}
+		out <- messageEvt
+	}
+}
+
+func handleMessageEvents(api *slack.Client, in <-chan *slackevents.MessageEvent) {
 	for messageEvt := range in {
 		logger.Printf("%s: %s\n", messageEvt.User, messageEvt.Text)
+
+		if messageEvt.User == "U15ATTX71" && messageEvt.Text == "test" {
+			if _, _, err := api.PostMessage(
+				messageEvt.Channel,
+				slack.MsgOptionText(":ah2:", false),
+			); err != nil {
+				logger.Println("error sending message:", err)
+			}
+		}
 	}
 }
