@@ -16,6 +16,7 @@ import (
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
+	"google.golang.org/api/iterator"
 	secretmanagerpb "google.golang.org/genproto/googleapis/cloud/secretmanager/v1"
 )
 
@@ -30,7 +31,15 @@ var (
 
 	slackClient     *socketmode.Client
 	datastoreClient *datastore.Client
+
+	twinLunchListKey = datastore.NameKey("TwinLunchList", "default", nil)
 )
+
+type TwinLunch struct {
+	User1, User2 string
+}
+
+type TwinLunchList struct{}
 
 func main() {
 	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -55,7 +64,7 @@ func main() {
 		twinLunchAdmins[twinLunchAdmin] = struct{}{}
 	}
 
-	logger.Printf("Listening on port %s", port)
+	logger.Printf("listening on port %s", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		logger.Fatal(err)
 	}
@@ -83,6 +92,8 @@ func start(ctx context.Context) {
 	if datastoreClient, err = datastore.NewClient(context.Background(), ""); err != nil {
 		logger.Fatal(err)
 	}
+
+	loadTwinLunches(ctx)
 
 	var messages = make(chan *slackevents.MessageEvent)
 	var filteredMessages = make(chan *slackevents.MessageEvent)
@@ -193,6 +204,15 @@ func run(messages <-chan *slackevents.MessageEvent, commands <-chan slack.SlashC
 					continue
 				}
 
+				if _, err := datastoreClient.Put(
+					context.TODO(),
+					datastore.IncompleteKey("TwinLunch", twinLunchListKey),
+					&TwinLunch{user1, user2},
+				); err != nil {
+					logger.Printf("error writing key in datastore: %s", err)
+					continue
+				}
+
 				twinLunches[user1], twinLunches[user2] = user2, user1
 
 				if err := sendBotMessageToUser(user1, "Salut ! Ton Twin Lunch a été choisi, tu peux discuter avec lui ou elle dans cette conversation sans révéler ton identité :sunglasses:"); err != nil {
@@ -227,6 +247,40 @@ func run(messages <-chan *slackevents.MessageEvent, commands <-chan slack.SlashC
 					continue
 				}
 
+				var ctx = context.TODO()
+
+				if _, err := datastoreClient.RunInTransaction(ctx, func(tx *datastore.Transaction) error {
+					var it = datastoreClient.Run(ctx, datastore.NewQuery("TwinLunch").Ancestor(twinLunchListKey).Transaction(tx))
+					var key *datastore.Key
+					var twinLunch TwinLunch
+
+					for {
+						var k, err = it.Next(&twinLunch)
+						if err == iterator.Done {
+							break
+						} else if err != nil {
+							return fmt.Errorf("error listing keys in datastore: %w", err)
+						}
+						if twinLunch.User1 == user1 || twinLunch.User2 == user1 {
+							key = k
+							break
+						}
+					}
+
+					if key == nil {
+						return errors.New("could not find twin lunch in datastore")
+					}
+
+					if err := tx.Delete(key); err != nil {
+						return fmt.Errorf("error deleting key in datastore: %w", err)
+					}
+
+					return nil
+				}); err != nil {
+					logger.Println(err)
+					continue
+				}
+
 				delete(twinLunches, user1)
 				delete(twinLunches, user2)
 
@@ -248,15 +302,41 @@ func run(messages <-chan *slackevents.MessageEvent, commands <-chan slack.SlashC
 					if _, ok := listed[user1]; ok {
 						continue
 					}
-					list = append(list, fmt.Sprintf(" • <@%s> et <@%s>", user1, user2))
+					list = append(list, fmt.Sprintf("• <@%s> et <@%s>", user1, user2))
 					listed[user1], listed[user2] = struct{}{}, struct{}{}
 				}
 
-				if err := sendBotMessageToUser(command.UserID, "Voilà la liste des Twin Lunch :\n"+strings.Join(list, "\n")); err != nil {
+				if err := sendBotMessageToUser(command.UserID, "Voilà la liste des Twin Lunch :\n\n"+strings.Join(list, "\n")); err != nil {
 					logger.Println(err)
 				}
 
 			case "/twinlunch-clear":
+				var ctx = context.TODO()
+
+				if _, err := datastoreClient.RunInTransaction(ctx, func(tx *datastore.Transaction) error {
+					var it = datastoreClient.Run(ctx, datastore.NewQuery("TwinLunch").Ancestor(twinLunchListKey).Transaction(tx))
+					var keys []*datastore.Key
+
+					for {
+						var k, err = it.Next(nil)
+						if err == iterator.Done {
+							break
+						} else if err != nil {
+							return fmt.Errorf("error listing keys in datastore: %w", err)
+						}
+						keys = append(keys, k)
+					}
+
+					if err := tx.DeleteMulti(keys); err != nil {
+						return fmt.Errorf("error deleting keys in datastore: %w", err)
+					}
+
+					return nil
+				}); err != nil {
+					logger.Println(err)
+					continue
+				}
+
 				twinLunches = make(map[string]string)
 
 				if err := sendBotMessageToUser(command.UserID, "J'ai supprimé tous les Twin Lunch :fire:"); err != nil {
@@ -351,4 +431,24 @@ func getSecrets(ctx context.Context, names ...string) (map[string]string, error)
 	}
 
 	return secrets, nil
+}
+
+func loadTwinLunches(ctx context.Context) {
+	logger.Println("loading twin lunches...")
+
+	var result []*TwinLunch
+
+	if _, err := datastoreClient.GetAll(
+		ctx,
+		datastore.NewQuery("TwinLunch").Ancestor(twinLunchListKey),
+		&result,
+	); err != nil {
+		logger.Fatalf("error reading twin lunches from datastore %s", err)
+	}
+
+	for _, twinLunch := range result {
+		twinLunches[twinLunch.User1], twinLunches[twinLunch.User2] = twinLunch.User2, twinLunch.User1
+	}
+
+	logger.Printf("loaded %d twin lunches", len(result))
 }
