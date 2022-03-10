@@ -1,56 +1,85 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"regexp"
 	"strings"
 
+	"cloud.google.com/go/datastore"
 	"github.com/joho/godotenv"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
 )
 
-var logger = log.New(os.Stdout, "main: ", log.Lshortfile|log.LstdFlags)
+var (
+	logger = log.New(os.Stdout, "main: ", log.Lshortfile|log.LstdFlags)
+	debug  bool
 
-var twinLunches = make(map[string]string)
+	userRegexp = regexp.MustCompile(`<@([^\|]+)\|[^>]+>`)
 
-var userRegexp = regexp.MustCompile("<@([^\\|]+)\\|[^>]+>")
+	twinLunches = make(map[string]string)
+
+	slackClient     *socketmode.Client
+	datastoreClient *datastore.Client
+)
 
 func main() {
-	if err := godotenv.Load(); err != nil {
+	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		logger.Fatal(err)
 	}
 
-	var debug = os.Getenv("DEBUG") == "true"
-	var slackAppToken, slackBotToken = os.Getenv("SLACK_APP_TOKEN"), os.Getenv("SLACK_BOT_TOKEN")
+	debug = os.Getenv("DEBUG") == "true"
 
-	var client = socketmode.New(
+	http.HandleFunc("/_ah/warmup", func(w http.ResponseWriter, r *http.Request) {
+		start()
+	})
+
+	var port = os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	logger.Printf("Listening on port %s", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		logger.Fatal(err)
+	}
+}
+
+func start() {
+	logger.Println("received warmup request, starting...")
+
+	var err error
+
+	slackClient = socketmode.New(
 		slack.New(
-			slackBotToken,
+			os.Getenv("SLACK_BOT_TOKEN"),
 			slack.OptionDebug(debug),
 			slack.OptionLog(log.New(os.Stdout, "slack: ", log.Lshortfile|log.LstdFlags)),
-			slack.OptionAppLevelToken(slackAppToken),
+			slack.OptionAppLevelToken(os.Getenv("SLACK_APP_TOKEN")),
 		),
 		socketmode.OptionDebug(debug),
 		socketmode.OptionLog(log.New(os.Stdout, "socketmode: ", log.Lshortfile|log.LstdFlags)),
 	)
 
+	if datastoreClient, err = datastore.NewClient(context.Background(), ""); err != nil {
+		logger.Fatal(err)
+	}
+
 	var messages = make(chan *slackevents.MessageEvent)
 	var filteredMessages = make(chan *slackevents.MessageEvent)
 	var commands = make(chan slack.SlashCommand)
 
-	go receiveEvents(client, messages, commands)
+	go receiveEvents(slackClient, messages, commands)
 	go filterMessages(messages, filteredMessages)
-	go run(client, filteredMessages, commands)
+	go run(filteredMessages, commands)
 
-	logger.Println("Running slack client...")
-
-	if err := client.Run(); err != nil {
-		logger.Fatal(err)
-	}
+	go runSlackClient()
 }
 
 func receiveEvents(client *socketmode.Client, messages chan<- *slackevents.MessageEvent, commands chan<- slack.SlashCommand) {
@@ -95,16 +124,16 @@ func filterMessages(in <-chan *slackevents.MessageEvent, out chan<- *slackevents
 	}
 }
 
-func run(client *socketmode.Client, messages <-chan *slackevents.MessageEvent, commands <-chan slack.SlashCommand) {
+func run(messages <-chan *slackevents.MessageEvent, commands <-chan slack.SlashCommand) {
 	for {
 		select {
 		case message := <-messages:
 			if twinLunch, ok := twinLunches[message.User]; ok {
-				if err := forwardTwinLunchMessage(client, twinLunch, message.Text); err != nil {
+				if err := forwardTwinLunchMessage(twinLunch, message.Text); err != nil {
 					log.Println(err)
 				}
 			} else {
-				if err := sendBotMessageToChannel(client, message.Channel, "Désolé tu n'as pas de Twin Lunch :crying_cat_face:"); err != nil {
+				if err := sendBotMessageToChannel(message.Channel, "Désolé tu n'as pas de Twin Lunch :crying_cat_face:"); err != nil {
 					log.Println(err)
 				}
 			}
@@ -115,7 +144,7 @@ func run(client *socketmode.Client, messages <-chan *slackevents.MessageEvent, c
 				var matches = userRegexp.FindAllStringSubmatch(command.Text, -1)
 
 				if len(matches) != 2 {
-					if err := sendBotMessageToUser(client, command.UserID, "Tu dois donner deux personnes pour créer un Twin Lunch"); err != nil {
+					if err := sendBotMessageToUser(command.UserID, "Tu dois donner deux personnes pour créer un Twin Lunch"); err != nil {
 						logger.Println(err)
 					}
 					continue
@@ -124,21 +153,21 @@ func run(client *socketmode.Client, messages <-chan *slackevents.MessageEvent, c
 				var user1, user2 = matches[0][1], matches[1][1]
 
 				if user1 == user2 {
-					if err := sendBotMessageToUser(client, command.UserID, "Tu dois donner deux personnes différentes pour créer un Twin Lunch"); err != nil {
+					if err := sendBotMessageToUser(command.UserID, "Tu dois donner deux personnes différentes pour créer un Twin Lunch"); err != nil {
 						logger.Println(err)
 					}
 					continue
 				}
 
 				if _, ok := twinLunches[user1]; ok {
-					if err := sendBotMessageToUser(client, command.UserID, fmt.Sprintf("<@%s> a déjà un Twin Lunch", user1)); err != nil {
+					if err := sendBotMessageToUser(command.UserID, fmt.Sprintf("<@%s> a déjà un Twin Lunch", user1)); err != nil {
 						logger.Println(err)
 					}
 					continue
 				}
 
 				if _, ok := twinLunches[user2]; ok {
-					if err := sendBotMessageToUser(client, command.UserID, fmt.Sprintf("<@%s> a déjà un Twin Lunch", user2)); err != nil {
+					if err := sendBotMessageToUser(command.UserID, fmt.Sprintf("<@%s> a déjà un Twin Lunch", user2)); err != nil {
 						logger.Println(err)
 					}
 					continue
@@ -146,15 +175,15 @@ func run(client *socketmode.Client, messages <-chan *slackevents.MessageEvent, c
 
 				twinLunches[user1], twinLunches[user2] = user2, user1
 
-				if err := sendBotMessageToUser(client, user1, "Salut ! Ton Twin Lunch a été choisi, tu peux discuter avec lui ou elle dans cette conversation sans révéler ton identité :sunglasses:"); err != nil {
+				if err := sendBotMessageToUser(user1, "Salut ! Ton Twin Lunch a été choisi, tu peux discuter avec lui ou elle dans cette conversation sans révéler ton identité :sunglasses:"); err != nil {
 					logger.Println(err)
 				}
 
-				if err := sendBotMessageToUser(client, user2, "Salut ! Ton Twin Lunch a été choisi, tu peux discuter avec lui ou elle dans cette conversation sans révéler ton identité :sunglasses:"); err != nil {
+				if err := sendBotMessageToUser(user2, "Salut ! Ton Twin Lunch a été choisi, tu peux discuter avec lui ou elle dans cette conversation sans révéler ton identité :sunglasses:"); err != nil {
 					logger.Println(err)
 				}
 
-				if err := sendBotMessageToUser(client, command.UserID, fmt.Sprintf("J'ai mis en relation <@%s> et <@%s> pour leur Twin Lunch", user1, user2)); err != nil {
+				if err := sendBotMessageToUser(command.UserID, fmt.Sprintf("J'ai mis en relation <@%s> et <@%s> pour leur Twin Lunch", user1, user2)); err != nil {
 					logger.Println(err)
 				}
 
@@ -163,7 +192,7 @@ func run(client *socketmode.Client, messages <-chan *slackevents.MessageEvent, c
 				var matches = userRegexp.FindAllStringSubmatch(command.Text, -1)
 
 				if len(matches) != 2 {
-					if err := sendBotMessageToUser(client, command.UserID, "Tu dois donner deux personnes pour supprimer un Twin Lunch"); err != nil {
+					if err := sendBotMessageToUser(command.UserID, "Tu dois donner deux personnes pour supprimer un Twin Lunch"); err != nil {
 						logger.Println(err)
 					}
 					continue
@@ -172,7 +201,7 @@ func run(client *socketmode.Client, messages <-chan *slackevents.MessageEvent, c
 				var user1, user2 = matches[0][1], matches[1][1]
 
 				if twinLunches[user1] != user2 {
-					if err := sendBotMessageToUser(client, command.UserID, fmt.Sprintf("<@%s> et <@%s> ne sont pas en Twin Lunch ensemble", user1, user2)); err != nil {
+					if err := sendBotMessageToUser(command.UserID, fmt.Sprintf("<@%s> et <@%s> ne sont pas en Twin Lunch ensemble", user1, user2)); err != nil {
 						logger.Println(err)
 					}
 					continue
@@ -181,13 +210,13 @@ func run(client *socketmode.Client, messages <-chan *slackevents.MessageEvent, c
 				delete(twinLunches, user1)
 				delete(twinLunches, user2)
 
-				if err := sendBotMessageToUser(client, command.UserID, fmt.Sprintf("J'ai supprimé le Twin Lunch entre <@%s> et <@%s>", user1, user2)); err != nil {
+				if err := sendBotMessageToUser(command.UserID, fmt.Sprintf("J'ai supprimé le Twin Lunch entre <@%s> et <@%s>", user1, user2)); err != nil {
 					logger.Println(err)
 				}
 
 			case "/twinlunch-list":
 				if len(twinLunches) == 0 {
-					if err := sendBotMessageToUser(client, command.UserID, "Il n'y a aucun Twin Lunch"); err != nil {
+					if err := sendBotMessageToUser(command.UserID, "Il n'y a aucun Twin Lunch"); err != nil {
 						logger.Println(err)
 					}
 					continue
@@ -203,14 +232,14 @@ func run(client *socketmode.Client, messages <-chan *slackevents.MessageEvent, c
 					listed[user1], listed[user2] = struct{}{}, struct{}{}
 				}
 
-				if err := sendBotMessageToUser(client, command.UserID, "Voilà la liste des Twin Lunch :\n"+strings.Join(list, "\n")); err != nil {
+				if err := sendBotMessageToUser(command.UserID, "Voilà la liste des Twin Lunch :\n"+strings.Join(list, "\n")); err != nil {
 					logger.Println(err)
 				}
 
 			case "/twinlunch-clear":
 				twinLunches = make(map[string]string)
 
-				if err := sendBotMessageToUser(client, command.UserID, "J'ai supprimé tous les Twin Lunch :fire:"); err != nil {
+				if err := sendBotMessageToUser(command.UserID, "J'ai supprimé tous les Twin Lunch :fire:"); err != nil {
 					logger.Println(err)
 				}
 			}
@@ -218,13 +247,13 @@ func run(client *socketmode.Client, messages <-chan *slackevents.MessageEvent, c
 	}
 }
 
-func forwardTwinLunchMessage(client *socketmode.Client, user string, text string) error {
-	var channel, err = getChannelForUser(client, user)
+func forwardTwinLunchMessage(user string, text string) error {
+	var channel, err = getChannelForUser(user)
 	if err != nil {
 		return err
 	}
 
-	if _, _, err := client.PostMessage(
+	if _, _, err := slackClient.PostMessage(
 		channel,
 		slack.MsgOptionText(text, false),
 		slack.MsgOptionIconEmoji("question"),
@@ -236,13 +265,13 @@ func forwardTwinLunchMessage(client *socketmode.Client, user string, text string
 	return nil
 }
 
-func sendBotMessageToUser(client *socketmode.Client, user string, text string) error {
-	var channel, err = getChannelForUser(client, user)
+func sendBotMessageToUser(user string, text string) error {
+	var channel, err = getChannelForUser(user)
 	if err != nil {
 		return err
 	}
 
-	if _, _, err := client.PostMessage(
+	if _, _, err := slackClient.PostMessage(
 		channel,
 		slack.MsgOptionIconEmoji("robot_face"),
 		slack.MsgOptionUsername("Twin Lunch Bot"),
@@ -253,8 +282,8 @@ func sendBotMessageToUser(client *socketmode.Client, user string, text string) e
 	return nil
 }
 
-func sendBotMessageToChannel(client *socketmode.Client, channel string, text string) error {
-	if _, _, err := client.PostMessage(
+func sendBotMessageToChannel(channel string, text string) error {
+	if _, _, err := slackClient.PostMessage(
 		channel,
 		slack.MsgOptionIconEmoji("robot_face"),
 		slack.MsgOptionUsername("Twin Lunch Bot"),
@@ -265,10 +294,18 @@ func sendBotMessageToChannel(client *socketmode.Client, channel string, text str
 	return nil
 }
 
-func getChannelForUser(client *socketmode.Client, user string) (string, error) {
-	var channel, _, _, err = client.OpenConversation(&slack.OpenConversationParameters{Users: []string{user}})
+func getChannelForUser(user string) (string, error) {
+	var channel, _, _, err = slackClient.OpenConversation(&slack.OpenConversationParameters{Users: []string{user}})
 	if err != nil {
 		return "", fmt.Errorf("error opening conversation: %w", err)
 	}
 	return channel.ID, nil
+}
+
+func runSlackClient() {
+	logger.Println("Running slack client...")
+
+	if err := slackClient.Run(); err != nil {
+		logger.Fatal(err)
+	}
 }
