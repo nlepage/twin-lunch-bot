@@ -11,10 +11,12 @@ import (
 	"strings"
 
 	"cloud.google.com/go/datastore"
+	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 	"github.com/joho/godotenv"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
+	secretmanagerpb "google.golang.org/genproto/googleapis/cloud/secretmanager/v1"
 )
 
 var (
@@ -37,7 +39,7 @@ func main() {
 	debug = os.Getenv("DEBUG") == "true"
 
 	http.HandleFunc("/_ah/warmup", func(w http.ResponseWriter, r *http.Request) {
-		start()
+		start(r.Context())
 	})
 
 	var port = os.Getenv("PORT")
@@ -51,17 +53,20 @@ func main() {
 	}
 }
 
-func start() {
+func start(ctx context.Context) {
 	logger.Println("received warmup request, starting...")
 
-	var err error
+	var secrets, err = getSecrets(ctx, "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	slackClient = socketmode.New(
 		slack.New(
-			os.Getenv("SLACK_BOT_TOKEN"),
+			secrets["SLACK_BOT_TOKEN"],
 			slack.OptionDebug(debug),
 			slack.OptionLog(log.New(os.Stdout, "slack: ", log.Lshortfile|log.LstdFlags)),
-			slack.OptionAppLevelToken(os.Getenv("SLACK_APP_TOKEN")),
+			slack.OptionAppLevelToken(secrets["SLACK_APP_TOKEN"]),
 		),
 		socketmode.OptionDebug(debug),
 		socketmode.OptionLog(log.New(os.Stdout, "socketmode: ", log.Lshortfile|log.LstdFlags)),
@@ -308,4 +313,27 @@ func runSlackClient() {
 	if err := slackClient.Run(); err != nil {
 		logger.Fatal(err)
 	}
+}
+
+func getSecrets(ctx context.Context, names ...string) (map[string]string, error) {
+	client, err := secretmanager.NewClient(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("error connecting to secret manager: %w", err)
+	}
+	defer client.Close()
+
+	var secrets = make(map[string]string)
+
+	for _, name := range names {
+		result, err := client.AccessSecretVersion(ctx, &secretmanagerpb.AccessSecretVersionRequest{
+			Name: fmt.Sprintf("projects/%s/secrets/%s/versions/latest", os.Getenv("GOOGLE_CLOUD_PROJECT"), name),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("error reading secret: %w", err)
+		}
+
+		secrets[name] = string(result.Payload.Data)
+	}
+
+	return secrets, nil
 }

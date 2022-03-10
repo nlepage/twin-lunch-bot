@@ -6,5 +6,3 @@ inbound_services:
   - warmup
 env_variables:
   DATASTORE_PROJECT_ID: twin-lunch-bot
-includes:
-  - env.yaml
