@@ -25,7 +25,8 @@ var (
 
 	userRegexp = regexp.MustCompile(`<@([^\|]+)\|[^>]+>`)
 
-	twinLunches = make(map[string]string)
+	twinLunches     = make(map[string]string)
+	twinLunchAdmins = make(map[string]struct{})
 
 	slackClient     *socketmode.Client
 	datastoreClient *datastore.Client
@@ -45,6 +46,13 @@ func main() {
 	var port = os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
+	}
+
+	for _, twinLunchAdmin := range strings.Split(os.Getenv("TWIN_LUNCH_ADMINS"), ",") {
+		if twinLunchAdmin == "" {
+			continue
+		}
+		twinLunchAdmins[twinLunchAdmin] = struct{}{}
 	}
 
 	logger.Printf("Listening on port %s", port)
@@ -144,6 +152,13 @@ func run(messages <-chan *slackevents.MessageEvent, commands <-chan slack.SlashC
 			}
 
 		case command := <-commands:
+			if _, ok := twinLunchAdmins[command.UserID]; !ok {
+				if err := sendBotMessageToUser(command.UserID, "Désolé mais tu n'as pas les droits pour administrer les Twin Lunch :no_entry_sign:"); err != nil {
+					logger.Println(err)
+				}
+				continue
+			}
+
 			switch command.Command {
 			case "/twinlunch-add":
 				var matches = userRegexp.FindAllStringSubmatch(command.Text, -1)
@@ -308,7 +323,7 @@ func getChannelForUser(user string) (string, error) {
 }
 
 func runSlackClient() {
-	logger.Println("Running slack client...")
+	logger.Println("running slack client...")
 
 	if err := slackClient.Run(); err != nil {
 		logger.Fatal(err)
