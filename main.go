@@ -9,6 +9,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/datastore"
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
@@ -153,245 +154,227 @@ func run(messages <-chan *slackevents.MessageEvent, commands <-chan slack.SlashC
 		select {
 		case message := <-messages:
 			if twinLunch, ok := twinLunches[message.User]; ok {
-				if err := forwardTwinLunchMessage(twinLunch, message.Text); err != nil {
-					log.Println(err)
-				}
+				forwardTwinLunchMessage(twinLunch, message.Text)
 			} else {
-				if err := sendBotMessageToChannel(message.Channel, "Désolé tu n'as pas de Twin Lunch :crying_cat_face:"); err != nil {
-					log.Println(err)
-				}
+				sendBotMessageToChannel(message.Channel, "Désolé tu n'as pas de Twin Lunch :crying_cat_face:", 0)
 			}
 
 		case command := <-commands:
 			if _, ok := twinLunchAdmins[command.UserID]; !ok {
-				if err := sendBotMessageToUser(command.UserID, "Désolé mais tu n'as pas les droits pour administrer les Twin Lunch :no_entry_sign:"); err != nil {
-					logger.Println(err)
-				}
+				sendBotMessageToUser(command.UserID, "Désolé mais tu n'as pas les droits pour administrer les Twin Lunch :no_entry_sign:", 0)
 				continue
 			}
 
 			switch command.Command {
 			case "/twinlunch-add":
-				var matches = userRegexp.FindAllStringSubmatch(command.Text, -1)
-
-				if len(matches) != 2 {
-					if err := sendBotMessageToUser(command.UserID, "Tu dois donner deux personnes pour créer un Twin Lunch"); err != nil {
-						logger.Println(err)
-					}
-					continue
-				}
-
-				var user1, user2 = matches[0][1], matches[1][1]
-
-				if user1 == user2 {
-					if err := sendBotMessageToUser(command.UserID, "Tu dois donner deux personnes différentes pour créer un Twin Lunch"); err != nil {
-						logger.Println(err)
-					}
-					continue
-				}
-
-				if _, ok := twinLunches[user1]; ok {
-					if err := sendBotMessageToUser(command.UserID, fmt.Sprintf("<@%s> a déjà un Twin Lunch", user1)); err != nil {
-						logger.Println(err)
-					}
-					continue
-				}
-
-				if _, ok := twinLunches[user2]; ok {
-					if err := sendBotMessageToUser(command.UserID, fmt.Sprintf("<@%s> a déjà un Twin Lunch", user2)); err != nil {
-						logger.Println(err)
-					}
-					continue
-				}
-
-				if _, err := datastoreClient.Put(
-					context.TODO(),
-					datastore.IncompleteKey("TwinLunch", twinLunchListKey),
-					&TwinLunch{user1, user2},
-				); err != nil {
-					logger.Printf("error writing key in datastore: %s", err)
-					continue
-				}
-
-				twinLunches[user1], twinLunches[user2] = user2, user1
-
-				if err := sendBotMessageToUser(user1, "Salut ! Ton Twin Lunch a été choisi, tu peux discuter avec lui ou elle dans cette conversation sans révéler ton identité :sunglasses:"); err != nil {
-					logger.Println(err)
-				}
-
-				if err := sendBotMessageToUser(user2, "Salut ! Ton Twin Lunch a été choisi, tu peux discuter avec lui ou elle dans cette conversation sans révéler ton identité :sunglasses:"); err != nil {
-					logger.Println(err)
-				}
-
-				if err := sendBotMessageToUser(command.UserID, fmt.Sprintf("J'ai mis en relation <@%s> et <@%s> pour leur Twin Lunch", user1, user2)); err != nil {
-					logger.Println(err)
-				}
+				handleAddCommand(command)
 
 			case "/twinlunch-remove":
-
-				var matches = userRegexp.FindAllStringSubmatch(command.Text, -1)
-
-				if len(matches) != 2 {
-					if err := sendBotMessageToUser(command.UserID, "Tu dois donner deux personnes pour supprimer un Twin Lunch"); err != nil {
-						logger.Println(err)
-					}
-					continue
-				}
-
-				var user1, user2 = matches[0][1], matches[1][1]
-
-				if twinLunches[user1] != user2 {
-					if err := sendBotMessageToUser(command.UserID, fmt.Sprintf("<@%s> et <@%s> ne sont pas en Twin Lunch ensemble", user1, user2)); err != nil {
-						logger.Println(err)
-					}
-					continue
-				}
-
-				var ctx = context.TODO()
-
-				if _, err := datastoreClient.RunInTransaction(ctx, func(tx *datastore.Transaction) error {
-					var it = datastoreClient.Run(ctx, datastore.NewQuery("TwinLunch").Ancestor(twinLunchListKey).Transaction(tx))
-					var key *datastore.Key
-					var twinLunch TwinLunch
-
-					for {
-						var k, err = it.Next(&twinLunch)
-						if err == iterator.Done {
-							break
-						} else if err != nil {
-							return fmt.Errorf("error listing keys in datastore: %w", err)
-						}
-						if twinLunch.User1 == user1 || twinLunch.User2 == user1 {
-							key = k
-							break
-						}
-					}
-
-					if key == nil {
-						return errors.New("could not find twin lunch in datastore")
-					}
-
-					if err := tx.Delete(key); err != nil {
-						return fmt.Errorf("error deleting key in datastore: %w", err)
-					}
-
-					return nil
-				}); err != nil {
-					logger.Println(err)
-					continue
-				}
-
-				delete(twinLunches, user1)
-				delete(twinLunches, user2)
-
-				if err := sendBotMessageToUser(command.UserID, fmt.Sprintf("J'ai supprimé le Twin Lunch entre <@%s> et <@%s>", user1, user2)); err != nil {
-					logger.Println(err)
-				}
+				handleRemoveCommand(command)
 
 			case "/twinlunch-list":
-				if len(twinLunches) == 0 {
-					if err := sendBotMessageToUser(command.UserID, "Il n'y a aucun Twin Lunch"); err != nil {
-						logger.Println(err)
-					}
-					continue
-				}
-
-				var list = make([]string, 0, len(twinLunches)/2)
-				var listed = make(map[string]struct{}, len(twinLunches))
-				for user1, user2 := range twinLunches {
-					if _, ok := listed[user1]; ok {
-						continue
-					}
-					list = append(list, fmt.Sprintf("• <@%s> et <@%s>", user1, user2))
-					listed[user1], listed[user2] = struct{}{}, struct{}{}
-				}
-
-				if err := sendBotMessageToUser(command.UserID, "Voilà la liste des Twin Lunch :\n\n"+strings.Join(list, "\n")); err != nil {
-					logger.Println(err)
-				}
+				handleListCommand(command)
 
 			case "/twinlunch-clear":
-				var ctx = context.TODO()
-
-				if _, err := datastoreClient.RunInTransaction(ctx, func(tx *datastore.Transaction) error {
-					var it = datastoreClient.Run(ctx, datastore.NewQuery("TwinLunch").Ancestor(twinLunchListKey).Transaction(tx))
-					var keys []*datastore.Key
-
-					for {
-						var k, err = it.Next(nil)
-						if err == iterator.Done {
-							break
-						} else if err != nil {
-							return fmt.Errorf("error listing keys in datastore: %w", err)
-						}
-						keys = append(keys, k)
-					}
-
-					if err := tx.DeleteMulti(keys); err != nil {
-						return fmt.Errorf("error deleting keys in datastore: %w", err)
-					}
-
-					return nil
-				}); err != nil {
-					logger.Println(err)
-					continue
-				}
-
-				twinLunches = make(map[string]string)
-
-				if err := sendBotMessageToUser(command.UserID, "J'ai supprimé tous les Twin Lunch :fire:"); err != nil {
-					logger.Println(err)
-				}
+				handleClearCommand(command)
 			}
 		}
 	}
 }
 
-func forwardTwinLunchMessage(user string, text string) error {
-	var channel, err = getChannelForUser(user)
-	if err != nil {
-		return err
+func handleAddCommand(command slack.SlashCommand) {
+	var matches = userRegexp.FindAllStringSubmatch(command.Text, -1)
+
+	if len(matches) != 2 {
+		sendBotMessageToUser(command.UserID, "Tu dois donner deux personnes pour créer un Twin Lunch", 0)
+		return
 	}
 
-	if _, _, err := slackClient.PostMessage(
-		channel,
-		slack.MsgOptionText(text, false),
-		slack.MsgOptionIconEmoji("question"),
-		slack.MsgOptionUsername("Ton Twin Lunch"),
+	var user1, user2 = matches[0][1], matches[1][1]
+
+	if user1 == user2 {
+		sendBotMessageToUser(command.UserID, "Tu dois donner deux personnes différentes pour créer un Twin Lunch", 0)
+		return
+	}
+
+	if _, ok := twinLunches[user1]; ok {
+		sendBotMessageToUser(command.UserID, fmt.Sprintf("<@%s> a déjà un Twin Lunch", user1), 0)
+		return
+	}
+
+	if _, ok := twinLunches[user2]; ok {
+		sendBotMessageToUser(command.UserID, fmt.Sprintf("<@%s> a déjà un Twin Lunch", user2), 0)
+		return
+	}
+
+	if _, err := datastoreClient.Put(
+		context.TODO(),
+		datastore.IncompleteKey("TwinLunch", twinLunchListKey),
+		&TwinLunch{user1, user2},
 	); err != nil {
-		return fmt.Errorf("error sending message: %w", err)
+		logger.Printf("error writing key in datastore: %s", err)
+		return
 	}
 
-	return nil
+	twinLunches[user1], twinLunches[user2] = user2, user1
+
+	sendBotMessageToUser(command.UserID, fmt.Sprintf("J'ai mis en relation <@%s> et <@%s> pour leur Twin Lunch", user1, user2), 0)
+
+	sendBotMessageToUser(user1, "Salut ! Ton Twin Lunch a été choisi, tu peux discuter avec lui ou elle dans cette conversation sans révéler ton identité :sunglasses:", 2*time.Second)
+
+	sendBotMessageToUser(user2, "Salut ! Ton Twin Lunch a été choisi, tu peux discuter avec lui ou elle dans cette conversation sans révéler ton identité :sunglasses:", 3*time.Second)
 }
 
-func sendBotMessageToUser(user string, text string) error {
-	var channel, err = getChannelForUser(user)
-	if err != nil {
-		return err
+func handleRemoveCommand(command slack.SlashCommand) {
+	var matches = userRegexp.FindAllStringSubmatch(command.Text, -1)
+
+	if len(matches) != 2 {
+		sendBotMessageToUser(command.UserID, "Tu dois donner deux personnes pour supprimer un Twin Lunch", 0)
+		return
 	}
 
-	if _, _, err := slackClient.PostMessage(
-		channel,
-		slack.MsgOptionIconEmoji("robot_face"),
-		slack.MsgOptionUsername("Twin Lunch Bot"),
-		slack.MsgOptionText("_bip bip_ "+text, false),
-	); err != nil {
-		return fmt.Errorf("error sending message: %w", err)
+	var user1, user2 = matches[0][1], matches[1][1]
+
+	if twinLunches[user1] != user2 {
+		sendBotMessageToUser(command.UserID, fmt.Sprintf("<@%s> et <@%s> ne sont pas en Twin Lunch ensemble", user1, user2), 0)
+		return
 	}
-	return nil
+
+	var ctx = context.TODO()
+
+	if _, err := datastoreClient.RunInTransaction(ctx, func(tx *datastore.Transaction) error {
+		var it = datastoreClient.Run(ctx, datastore.NewQuery("TwinLunch").Ancestor(twinLunchListKey).Transaction(tx))
+		var key *datastore.Key
+		var twinLunch TwinLunch
+
+		for {
+			var k, err = it.Next(&twinLunch)
+			if err == iterator.Done {
+				break
+			} else if err != nil {
+				return fmt.Errorf("error listing keys in datastore: %w", err)
+			}
+			if twinLunch.User1 == user1 || twinLunch.User2 == user1 {
+				key = k
+				break
+			}
+		}
+
+		if key == nil {
+			return errors.New("could not find twin lunch in datastore")
+		}
+
+		if err := tx.Delete(key); err != nil {
+			return fmt.Errorf("error deleting key in datastore: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		logger.Println(err)
+		return
+	}
+
+	delete(twinLunches, user1)
+	delete(twinLunches, user2)
+
+	sendBotMessageToUser(command.UserID, fmt.Sprintf("J'ai supprimé le Twin Lunch entre <@%s> et <@%s>", user1, user2), 0)
 }
 
-func sendBotMessageToChannel(channel string, text string) error {
-	if _, _, err := slackClient.PostMessage(
-		channel,
-		slack.MsgOptionIconEmoji("robot_face"),
-		slack.MsgOptionUsername("Twin Lunch Bot"),
-		slack.MsgOptionText("_bip bip_ "+text, false),
-	); err != nil {
-		return fmt.Errorf("error sending message: %w", err)
+func handleListCommand(command slack.SlashCommand) {
+	if len(twinLunches) == 0 {
+		sendBotMessageToUser(command.UserID, "Il n'y a aucun Twin Lunch", 0)
+		return
 	}
-	return nil
+
+	var list = make([]string, 0, len(twinLunches)/2)
+	var listed = make(map[string]struct{}, len(twinLunches))
+	for user1, user2 := range twinLunches {
+		if _, ok := listed[user1]; ok {
+			continue
+		}
+		list = append(list, fmt.Sprintf("• <@%s> et <@%s>", user1, user2))
+		listed[user1], listed[user2] = struct{}{}, struct{}{}
+	}
+
+	sendBotMessageToUser(command.UserID, "Voilà la liste des Twin Lunch :\n\n"+strings.Join(list, "\n"), 0)
+}
+
+func handleClearCommand(command slack.SlashCommand) {
+	var ctx = context.TODO()
+
+	if _, err := datastoreClient.RunInTransaction(ctx, func(tx *datastore.Transaction) error {
+		var it = datastoreClient.Run(ctx, datastore.NewQuery("TwinLunch").Ancestor(twinLunchListKey).Transaction(tx))
+		var keys []*datastore.Key
+
+		for {
+			var k, err = it.Next(nil)
+			if err == iterator.Done {
+				break
+			} else if err != nil {
+				return fmt.Errorf("error listing keys in datastore: %w", err)
+			}
+			keys = append(keys, k)
+		}
+
+		if err := tx.DeleteMulti(keys); err != nil {
+			return fmt.Errorf("error deleting keys in datastore: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		logger.Println(err)
+		return
+	}
+
+	twinLunches = make(map[string]string)
+
+	sendBotMessageToUser(command.UserID, "J'ai supprimé tous les Twin Lunch :fire:", 0)
+}
+
+func forwardTwinLunchMessage(user string, text string) {
+	var channel, err = getChannelForUser(user)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	time.AfterFunc(time.Second, func() {
+		if _, _, err := slackClient.PostMessage(
+			channel,
+			slack.MsgOptionText(text, false),
+			slack.MsgOptionIconEmoji("question"),
+			slack.MsgOptionUsername("Ton Twin Lunch"),
+		); err != nil {
+			log.Printf("error sending message: %w", err)
+		}
+	})
+}
+
+func sendBotMessageToUser(user string, text string, after time.Duration) {
+	var channel, err = getChannelForUser(user)
+	if err != nil {
+		logger.Println(err)
+		return
+	}
+
+	sendBotMessageToChannel(channel, text, after)
+}
+
+func sendBotMessageToChannel(channel string, text string, after time.Duration) {
+	if after == 0 {
+		after = time.Second
+	}
+
+	time.AfterFunc(after, func() {
+		if _, _, err := slackClient.PostMessage(
+			channel,
+			slack.MsgOptionIconEmoji("robot_face"),
+			slack.MsgOptionUsername("Twin Lunch Bot"),
+			slack.MsgOptionText("_bip bip_ "+text, false),
+		); err != nil {
+			logger.Printf("error sending message: %w", err)
+		}
+	})
 }
 
 func getChannelForUser(user string) (string, error) {
